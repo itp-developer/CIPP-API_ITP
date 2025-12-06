@@ -24,17 +24,15 @@ function Get-CIPPTenantAlignment {
         [Parameter(Mandatory = $false)]
         [string]$TemplateId
     )
-
+    $TemplateTable = Get-CippTable -tablename 'templates'
+    $TemplateFilter = "PartitionKey eq 'StandardsTemplateV2'"
     try {
         # Get all standard templates
-        $TemplateTable = Get-CippTable -tablename 'templates'
-        $TemplateFilter = "PartitionKey eq 'StandardsTemplateV2'"
-
         $Templates = (Get-CIPPAzDataTableEntity @TemplateTable -Filter $TemplateFilter) | ForEach-Object {
             $JSON = $_.JSON -replace '"Action":', '"action":'
             try {
                 $RowKey = $_.RowKey
-                $Data = $JSON | ConvertFrom-Json -Depth 100 -ErrorAction SilentlyContinue
+                $Data = $JSON | ConvertFrom-Json -Depth 100 -ErrorAction Stop
             } catch {
                 Write-Warning "$($RowKey) standard could not be loaded: $($_.Exception.Message)"
                 return
@@ -51,18 +49,30 @@ function Get-CIPPTenantAlignment {
         }
 
         # Get standards comparison data
-        $StandardsTable = Get-CIPPTable -TableName 'CippStandardsReports'
-        $AllStandards = Get-CIPPAzDataTableEntity @StandardsTable -Filter "PartitionKey ne 'StandardReport'"
+        $AllStandards = Measure-CippTask -TaskName 'LoadStandardsData' -EventName 'CIPP.AlignmentStatus' -Metadata @{
+            Tenant  = $TenantFilter
+            Section = 'LoadStandardsData'
+        } -Script {
+            $StandardsTable = Get-CippTable -TableName 'CippStandardsReports'
+            #this if statement is to bring down performance when running scheduled checks, we have to revisit this to a better query due to the extreme size this can get.
+            if ($TenantFilter) {
+                $filter = "PartitionKey eq '$TenantFilter'"
+            } else {
+                $filter = "PartitionKey ne 'StandardReport' and PartitionKey ne ''"
+            }
+            Get-CIPPAzDataTableEntity @StandardsTable -Filter $filter
+        }
 
         # Filter by tenant if specified
         $Standards = if ($TenantFilter) {
-            $AllStandards | Where-Object { $_.PartitionKey -eq $TenantFilter }
-        } else {
             $AllStandards
+        } else {
+            $Tenants = Get-Tenants -IncludeErrors
+            $AllStandards | Where-Object { $_.PartitionKey -in $Tenants.defaultDomainName }
         }
 
         # Build tenant standards data structure
-        $TenantStandards = @{}
+        $tenantData = @{}
         foreach ($Standard in $Standards) {
             $FieldName = $Standard.RowKey
             $FieldValue = $Standard.Value
@@ -71,20 +81,29 @@ function Get-CIPPTenantAlignment {
             # Process field value
             if ($FieldValue -is [System.Boolean]) {
                 $FieldValue = [bool]$FieldValue
-            } elseif ($FieldValue -like '*{*') {
-                $FieldValue = ConvertFrom-Json -Depth 100 -InputObject $FieldValue -ErrorAction SilentlyContinue
+            } elseif (Test-Json -Json $FieldValue -ErrorAction SilentlyContinue) {
+                try {
+                    $FieldValue = ConvertFrom-Json -Depth 100 -InputObject $FieldValue -ErrorAction Stop
+                } catch {
+                    Write-Warning "$($FieldName) standard report could not be loaded: $($_.Exception.Message)"
+                    $FieldValue = [PSCustomObject]@{
+                        Error         = "Invalid JSON format: $($_.Exception.Message)"
+                        OriginalValue = $FieldValue
+                    }
+                }
             } else {
                 $FieldValue = [string]$FieldValue
             }
 
-            if (-not $TenantStandards.ContainsKey($Tenant)) {
-                $TenantStandards[$Tenant] = @{}
+            if (-not $tenantData.ContainsKey($Tenant)) {
+                $tenantData[$Tenant] = @{}
             }
-            $TenantStandards[$Tenant][$FieldName] = @{
+            $tenantData[$Tenant][$FieldName] = @{
                 Value       = $FieldValue
                 LastRefresh = $Standard.TimeStamp.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
             }
         }
+        $TenantStandards = $tenantData
 
         $Results = [System.Collections.Generic.List[object]]::new()
 
@@ -147,6 +166,22 @@ function Get-CIPPTenantAlignment {
                             [PSCustomObject]@{
                                 StandardId       = $IntuneStandardId
                                 ReportingEnabled = $IntuneReportingEnabled
+                            }
+                        }
+                        if ($IntuneTemplate.'TemplateList-Tags') {
+                            foreach ($Tag in $IntuneTemplate.'TemplateList-Tags') {
+                                Write-Host "Processing Intune Tag: $($Tag.value)"
+                                $IntuneActions = if ($IntuneTemplate.action) { $IntuneTemplate.action } else { @() }
+                                $IntuneReportingEnabled = ($IntuneActions | Where-Object { $_.value -and ($_.value.ToLower() -eq 'report' -or $_.value.ToLower() -eq 'remediate') }).Count -gt 0
+                                $TemplatesList = Get-CIPPAzDataTableEntity @TemplateTable -Filter $Filter | Where-Object -Property package -EQ $Tag.value
+                                $TemplatesList | ForEach-Object {
+                                    $TagStandardId = "standards.IntuneTemplate.$($_.GUID)"
+                                    [PSCustomObject]@{
+                                        StandardId       = $TagStandardId
+                                        ReportingEnabled = $IntuneReportingEnabled
+                                    }
+                                }
+
                             }
                         }
                     }
@@ -215,7 +250,7 @@ function Get-CIPPTenantAlignment {
                         [PSCustomObject]@{
                             StandardName      = $StandardKey
                             Compliant         = $IsCompliant
-                            StandardValue     = ($Value | ConvertTo-Json -Compress)
+                            StandardValue     = ($Value | ConvertTo-Json -Depth 100 -Compress)
                             ComplianceStatus  = $ComplianceStatus
                             ReportingDisabled = $IsReportingDisabled
                         }
