@@ -51,7 +51,7 @@ function New-CIPPIntuneTemplate {
         'configurationPolicies' {
             $Type = 'Catalog'
             $Template = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/deviceManagement/$($urlname)('$($ID)')?`$expand=settings" -tenantid $TenantFilter | Select-Object name, description, settings, platforms, technologies, templateReference
-            $TemplateJson = $Template | ConvertTo-Json -Depth 100
+            $TemplateJson = $Template | ConvertTo-Json -Depth 100 -Compress
             $DisplayName = $Template.name
 
         }
@@ -64,6 +64,13 @@ function New-CIPPIntuneTemplate {
         'deviceConfigurations' {
             $Type = 'Device'
             $Template = New-GraphGetRequest -uri "https://graph.microsoft.com/beta/deviceManagement/$($urlname)/$($ID)" -tenantid $TenantFilter | Select-Object * -ExcludeProperty id, lastModifiedDateTime, '@odata.context', 'ScopeTagIds', 'supportsScopeTags', 'createdDateTime'
+
+            # Check for and decrypt encrypted OMA settings
+            if ($Template.omaSettings) {
+                Write-Information "Checking for encrypted OMA settings in policy: $($Template.displayName)"
+                $Template = Get-CIPPOmaSettingDecryptedValue -DeviceConfiguration $Template -DeviceConfigurationId $ID -TenantFilter $TenantFilter
+            }
+
             $DisplayName = $Template.displayName
             $TemplateJson = ConvertTo-Json -InputObject $Template -Depth 100 -Compress
         }
