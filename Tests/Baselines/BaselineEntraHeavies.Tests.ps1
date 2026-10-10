@@ -4,7 +4,7 @@
 
 BeforeAll {
     $script:RepoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSCommandPath))
-    $Baselines = Join-Path $script:RepoRoot 'Modules/CIPPCore/Public/Baselines'
+    $Baselines = Join-Path $script:RepoRoot 'Modules/CIPPBaselines/Public'
 
     function New-CIPPDbRequest { param($TenantFilter, $Type) }
     function Write-LogMessage { param($API, $tenant, $message, $Sev, $LogData) }
@@ -16,11 +16,11 @@ BeforeAll {
 
     . (Join-Path $script:RepoRoot 'Modules/CIPPCore/Public/Get-CIPPIntuneCompareExclusions.ps1')
     . (Join-Path $script:RepoRoot 'Modules/CIPPCore/Public/Compare-CIPPIntuneObject.ps1')
-    . (Join-Path $Baselines 'Get-CIPPBaselineCacheRows.ps1')
-    . (Join-Path $Baselines 'Test-CIPPBaselineCacheCollected.ps1')
+    . (Join-Path $Baselines 'Helpers/Get-CIPPBaselineCacheRows.ps1')
+    . (Join-Path $Baselines 'Helpers/Test-CIPPBaselineCacheCollected.ps1')
     foreach ($Name in @('FIDO2PasskeyProfiles', 'CopilotLimitedMode', 'NudgeMFA', 'OauthConsent', 'DisableSelfServiceLicenses', 'AuthenticationMethods')) {
-        . (Join-Path $Baselines "Get-CIPPBaseline${Name}State.ps1")
-        . (Join-Path $Baselines "Invoke-CIPPBaseline${Name}.ps1")
+        . (Join-Path $Baselines "PrepareHooks/Get-CIPPBaseline${Name}State.ps1")
+        . (Join-Path $Baselines "Executors/Invoke-CIPPBaseline${Name}.ps1")
     }
 
     $script:Tenant = 'contoso.onmicrosoft.com'
@@ -280,7 +280,7 @@ Describe 'Get-CIPPBaselineDisableSelfServiceLicensesState' {
         Invoke-CIPPBaselineDisableSelfServiceLicenses -Remediate $null -TenantFilter $script:Tenant -Current $Prepared.Current
         Should -Invoke New-GraphPostRequest -ParameterFilter { $uri -match 'autoclaim' }
         Should -Invoke New-GraphPostRequest -ParameterFilter { $uri -match 'authorizationPolicy' -and $type -eq 'PATCH' }
-        Should -Invoke New-GraphPostRequest -ParameterFilter { $uri -match 'licensing.m365.microsoft.com' -and $type -eq 'PUT' }
+        Should -Invoke New-GraphPostRequest -ParameterFilter { $uri -match 'licensing.m365.microsoft.com' -and $type -eq 'PUT' -and $AsApp }
     }
 }
 
