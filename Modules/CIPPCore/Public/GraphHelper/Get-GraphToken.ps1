@@ -20,7 +20,7 @@ function Get-GraphToken {
 
     # Certificate-exclusive auth: force the SAM certificate for CIPP's own SAM app tokens (app-only and
     # delegated). Scoped to the SAM app - explicit $AppID/$AppSecret callers use their own credentials.
-    if ($env:CertificateAuthMode -and -not $AppID -and -not $AppSecret) {
+    if ([System.Environment]::GetEnvironmentVariable('CertificateAuthMode') -and -not $AppID -and -not $AppSecret) {
         $UseCertificate = $true
     }
 
@@ -42,6 +42,8 @@ function Get-GraphToken {
                 [CIPP.CIPPTokenCache]::Remove($SharedTokenCacheKey)
             }
         }
+        $CachedFailure = [CIPP.CIPPTokenCache]::Lookup("$SharedTokenCacheKey|failed", 0)
+        if ($CachedFailure.Found) { throw "Could not get token: $($CachedFailure.TokenPayloadJson)" }
     }
 
     # ── Slow path: need a new token — do table lookups + token acquisition ──
@@ -63,6 +65,12 @@ function Get-GraphToken {
                 } catch {
                     [CIPP.CIPPTokenCache]::Remove($SharedTokenCacheKey)
                 }
+            }
+            $CachedFailure = [CIPP.CIPPTokenCache]::Lookup("$SharedTokenCacheKey|failed", 0)
+            if ($CachedFailure.Found) {
+                [CIPP.CIPPTokenCache]::ReleaseLock($SharedTokenCacheKey)
+                $LockAcquired = $false
+                throw "Could not get token: $($CachedFailure.TokenPayloadJson)"
             }
         }
     }
@@ -187,7 +195,8 @@ function Get-GraphToken {
             }
             if ($null -eq $AccessToken.expires_on -and $AccessToken.expires_in) {
                 $ExpiresOn = [int](Get-Date -UFormat %s -Millisecond 0) + $AccessToken.expires_in
-                Add-Member -InputObject $AccessToken -NotePropertyName 'expires_on' -NotePropertyValue $ExpiresOn -Force
+                $AccessToken.PSObject.Properties.Remove('expires_on')
+                $AccessToken.PSObject.Properties.Add([psnoteproperty]::new('expires_on', $ExpiresOn))
             }
 
             if ($UseSharedTokenCache -and $SharedTokenCacheKey) {
@@ -209,7 +218,6 @@ function Get-GraphToken {
             if (!$Tenant.RowKey) {
                 $donotset = $true
                 $Tenant = [pscustomobject]@{
-                    GraphErrorCount     = 0
                     LastGraphTokenError = ''
                     LastGraphError      = ''
                     PartitionKey        = 'TenantFailed'
@@ -226,9 +234,12 @@ function Get-GraphToken {
             } else {
                 $_.Exception.Message
             }
-            $Tenant.GraphErrorCount++
 
             if (!$donotset) { Update-AzDataTableEntity -Force @TenantsTable -Entity $Tenant }
+            # Errors that only an admin can fix: fail fast for 30 min instead of re-asking Entra on every call.
+            if ($UseSharedTokenCache -and $SharedTokenCacheKey -and $Tenant.LastGraphError -match 'AADSTS(7000215|7000222|700082|9002313|50173|700016|7000229|500014|500011|90002|50020|65001|50076|50079|53003)\b') {
+                [CIPP.CIPPTokenCache]::Store("$SharedTokenCacheKey|failed", [string]$Tenant.LastGraphError, [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 1800)
+            }
             throw "Could not get token: $($Tenant.LastGraphError)"
         }
     } finally {

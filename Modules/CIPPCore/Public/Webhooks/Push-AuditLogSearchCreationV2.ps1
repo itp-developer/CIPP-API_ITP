@@ -33,7 +33,10 @@ function Push-AuditLogSearchCreationV2 {
 
     try {
         $Ledger = Get-CippTable -TableName 'AuditLogCoverage'
-        $Rows = @(Get-CIPPAzDataTableEntity @Ledger -Filter "PartitionKey eq '$TenantFilter'")
+        # Whole partition: re-planned MANUAL-* rows need re-creating too. No split markers - these rows never split.
+        $TenantKey = ([string]$TenantFilter).Replace("'", "''")
+        $Rows = @(Get-CIPPAzDataTableEntity @Ledger -Filter "PartitionKey eq '$TenantKey'" `
+                -Property 'RowKey', 'WindowStart', 'WindowEnd', 'State', 'NextAttemptUtc', 'Attempts', 'RetryCount', 'ThrottleCount')
         $Now = (Get-Date).ToUniversalTime()
 
         # 1) Seed owed regular + reconciliation windows as Planned.
@@ -131,6 +134,9 @@ function Push-AuditLogSearchCreationV2 {
                 } catch {}
                 Add-CIPPAzDataTableEntity @Ledger -Entity @{ PartitionKey = $TenantFilter; RowKey = $Row.RowKey; State = 'Skipped'; LastError = $LedgerError; LastErrorUtc = $Now } -OperationType UpsertMerge
                 Write-Information "AuditLogV2: $DisableStatus for $TenantFilter; disabled for 24h"
+                if ($Result.Outcome -eq 'AccessDenied') {
+                    Write-LogMessage -API 'Audit Logs' -tenant $TenantFilter -message "Audit log collection paused for 24 hours: $LedgerError" -sev Warning
+                }
             } else {
                 # Other transient: retry this window next cycle; dead-letter at cap.
                 $RetryTotal = [int]$Row.RetryCount + 1

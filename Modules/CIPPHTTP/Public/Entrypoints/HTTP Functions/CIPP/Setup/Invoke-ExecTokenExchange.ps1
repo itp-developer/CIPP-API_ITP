@@ -12,30 +12,43 @@ function Invoke-ExecTokenExchange {
     $KV = Get-CippKeyVaultName
     $APIName = $Request.Params.CIPPEndpoint
 
+    if (!$Request.Body) {
+        Write-LogMessage -API $APIName -message 'Request body is missing' -Sev 'Error'
+        return ([HttpResponseContext]@{
+                StatusCode = [HttpStatusCode]::BadRequest
+                Body       = @{ error = 'invalid_request'; error_description = 'Request body is missing' }
+                Headers    = @{'Content-Type' = 'application/json' }
+            })
+    }
+
+    $TokenRequest = $Request.Body.tokenRequest
+    $TokenUrl = $Request.Body.tokenUrl
+    $TenantId = $Request.Body.tenantId
+
+    if (!$TokenRequest -or !$TokenUrl) {
+        Write-LogMessage -API $APIName -message 'Missing required parameters: tokenRequest or tokenUrl' -Sev 'Error'
+        return ([HttpResponseContext]@{
+                StatusCode = [HttpStatusCode]::BadRequest
+                Body       = @{ error = 'invalid_request'; error_description = 'Missing required parameters: tokenRequest or tokenUrl' }
+                Headers    = @{'Content-Type' = 'application/json' }
+            })
+    }
+
+    $ParsedTokenUri = $null
+    $IsValidTokenUri = [System.Uri]::TryCreate($TokenUrl, [System.UriKind]::Absolute, [ref]$ParsedTokenUri)
+    if (-not $IsValidTokenUri -or
+        -not $ParsedTokenUri.Scheme.Equals('https', [System.StringComparison]::OrdinalIgnoreCase) -or
+        -not $ParsedTokenUri.Host.Equals('login.microsoftonline.com', [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-LogMessage -API $APIName -message "Blocked token request to non-Microsoft login host: $TokenUrl" -Sev 'Warning'
+        return ([HttpResponseContext]@{
+                StatusCode = [HttpStatusCode]::BadRequest
+                Body       = @{ error = 'invalid_request'; error_description = 'Invalid tokenUrl. Only https://login.microsoftonline.com is allowed.' }
+                Headers    = @{'Content-Type' = 'application/json' }
+            })
+    }
+
+    $StatusCode = [HttpStatusCode]::OK
     try {
-        if (!$Request.Body) {
-            Write-LogMessage -API $APIName -message 'Request body is missing' -Sev 'Error'
-            throw 'Request body is missing'
-        }
-
-        $TokenRequest = $Request.Body.tokenRequest
-        $TokenUrl = $Request.Body.tokenUrl
-        $TenantId = $Request.Body.tenantId
-
-        if (!$TokenRequest -or !$TokenUrl) {
-            Write-LogMessage -API $APIName -message 'Missing required parameters: tokenRequest or tokenUrl' -Sev 'Error'
-            throw 'Missing required parameters: tokenRequest or tokenUrl'
-        }
-
-        $ParsedTokenUri = $null
-        $IsValidTokenUri = [System.Uri]::TryCreate($TokenUrl, [System.UriKind]::Absolute, [ref]$ParsedTokenUri)
-        if (-not $IsValidTokenUri -or
-            -not $ParsedTokenUri.Scheme.Equals('https', [System.StringComparison]::OrdinalIgnoreCase) -or
-            -not $ParsedTokenUri.Host.Equals('login.microsoftonline.com', [System.StringComparison]::OrdinalIgnoreCase)) {
-            Write-LogMessage -API $APIName -message "Blocked token request to non-Microsoft login host: $TokenUrl" -Sev 'Warning'
-            throw 'Invalid tokenUrl. Only https://login.microsoftonline.com is allowed.'
-        }
-
         Write-LogMessage -API $APIName -message "Making token request to $TokenUrl" -Sev 'Info'
 
         # Make sure we get the latest authentication (also refreshes $env:CertificateAuthMode)
@@ -72,15 +85,20 @@ function Invoke-ExecTokenExchange {
 
         if ($UseCertAssertion) {
             $AppId = $FormData['client_id']
-            if (!$AppId) { throw 'Token request is missing client_id; cannot build a certificate assertion.' }
+            if (!$AppId) {
+                return ([HttpResponseContext]@{
+                        StatusCode = [HttpStatusCode]::BadRequest
+                        Body       = @{ error = 'invalid_request'; error_description = 'Token request is missing client_id; cannot build a certificate assertion.' }
+                        Headers    = @{'Content-Type' = 'application/json' }
+                    })
+            }
             $SAMCert = Get-CIPPSAMCertificate -SkipCache
             if (-not $SAMCert) {
                 throw 'Certificate authentication is required but no SAM certificate is available. Complete the application step first, then retry.'
             }
-            # Assertion audience = the tenant the sign-in targets ($env:TenantID). The body's tenantId is
-            # actually the app id, so it is not a valid audience; fall back to the multi-tenant authority.
-            $GuidPattern = '^[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}$'
-            $AssertionTenant = if ($env:TenantID -match $GuidPattern) { $env:TenantID } else { 'organizations' }
+            # aud must equal the token endpoint we POST to (validated above). Do not use
+            # $env:TenantID: the frontend posts to /organizations, and a partner-GUID aud
+            # produces AADSTS700023. Body tenantId is the app id, not a realm.
             $FormData.Remove('client_secret')
             $FormData['client_assertion_type'] = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
             Write-LogMessage -API $APIName -message 'Using the SAM certificate assertion for the token exchange' -Sev 'Debug'
@@ -93,7 +111,7 @@ function Invoke-ExecTokenExchange {
         $MaxAttempts = if ($UseCertAssertion) { 3 } else { 1 }
         for ($Attempt = 1; $Attempt -le $MaxAttempts; $Attempt++) {
             if ($UseCertAssertion) {
-                $FormData['client_assertion'] = New-CIPPCertificateAssertion -TenantId $AssertionTenant -AppId $AppId -Certificate $SAMCert.Certificate
+                $FormData['client_assertion'] = New-CIPPCertificateAssertion -TenantId 'organizations' -AppId $AppId -Certificate $SAMCert.Certificate -Audience $TokenUrl
             }
             $Results = Invoke-RestMethod -Uri $TokenUrl -Method Post -Body $FormData -ContentType 'application/x-www-form-urlencoded' -ErrorAction Stop -SkipHttpErrorCheck
             if ($UseCertAssertion -and $Attempt -lt $MaxAttempts -and $Results.error_description -match 'AADSTS700027') {
@@ -104,23 +122,20 @@ function Invoke-ExecTokenExchange {
             break
         }
     } catch {
+        $StatusCode = [HttpStatusCode]::InternalServerError
         $ErrorMessage = $_.Exception
         $Results = @{
             error             = 'server_error'
             error_description = "Token exchange failed: $ErrorMessage"
         }
     }
-    if ($Results.error) {
-        return ([HttpResponseContext]@{
-                StatusCode = [HttpStatusCode]::BadRequest
-                Body       = $Results
-                Headers    = @{'Content-Type' = 'application/json' }
-            })
-    } else {
-        return ([HttpResponseContext]@{
-                StatusCode = [HttpStatusCode]::OK
-                Body       = $Results
-                Headers    = @{'Content-Type' = 'application/json' }
-            })
+    if ($Results.error -and $StatusCode -eq [HttpStatusCode]::OK) {
+        # The token endpoint's own OAuth error (invalid_grant and the like) is passed through as a client error
+        $StatusCode = [HttpStatusCode]::BadRequest
     }
+    return ([HttpResponseContext]@{
+            StatusCode = $StatusCode
+            Body       = $Results
+            Headers    = @{'Content-Type' = 'application/json' }
+        })
 }
